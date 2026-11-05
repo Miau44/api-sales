@@ -2,11 +2,14 @@
 
 namespace App\Services;
 
+use App\Exceptions\SaleNotFoundException;
+use App\Exceptions\SaleRestockException;
 use App\Exceptions\SaleUserNotFoundException;
 use App\Models\Product;
 use App\Models\Sale;
 use App\Models\User;
 use App\Support\Money;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
 
@@ -15,6 +18,76 @@ class SaleService
     private const SALES_USER_ID = 1;
 
     private const MAX_QUANTITY = 4_294_967_295;
+
+    private const MAX_STOCK = 4_294_967_295;
+
+    /** @return Collection<int, Sale> */
+    public function list(): Collection
+    {
+        return Sale::query()
+            ->with(['details.product'])
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->get();
+    }
+
+    public function delete(int $saleId): void
+    {
+        DB::transaction(function () use ($saleId): void {
+            $sale = Sale::query()
+                ->whereKey($saleId)
+                ->lockForUpdate()
+                ->first();
+
+            if (! $sale) {
+                throw new SaleNotFoundException($saleId);
+            }
+
+            $details = $sale->details()
+                ->orderBy('product_id')
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get(['id', 'sale_id', 'product_id', 'quantity']);
+
+            $quantitiesByProduct = [];
+            foreach ($details as $detail) {
+                $productId = (int) $detail->product_id;
+                $quantity = (int) $detail->quantity;
+                $currentQuantity = $quantitiesByProduct[$productId] ?? 0;
+
+                if ($quantity > self::MAX_STOCK - $currentQuantity) {
+                    throw new SaleRestockException($productId);
+                }
+
+                $quantitiesByProduct[$productId] = $currentQuantity + $quantity;
+            }
+            ksort($quantitiesByProduct, SORT_NUMERIC);
+
+            foreach ($quantitiesByProduct as $productId => $quantity) {
+                $product = Product::query()
+                    ->whereKey($productId)
+                    ->lockForUpdate()
+                    ->first();
+
+                if (! $product) {
+                    throw new SaleRestockException($productId);
+                }
+
+                $updatedRows = Product::query()
+                    ->whereKey($productId)
+                    ->where('stock', '<=', self::MAX_STOCK - $quantity)
+                    ->increment('stock', $quantity);
+
+                if ($updatedRows !== 1) {
+                    throw new SaleRestockException($productId);
+                }
+            }
+
+            if (! $sale->delete()) {
+                throw new SaleRestockException();
+            }
+        }, attempts: 3);
+    }
 
     /**
      * @param array<int, array{product_id: int|string, quantity: int|string}> $items
@@ -62,7 +135,6 @@ class SaleService
 
                 $subtotalInMinorUnits = $priceInMinorUnits * $quantity;
                 $products[$productId] = [
-                    'model' => $product,
                     'quantity' => $quantity,
                     'price' => Money::toDecimalString($priceInMinorUnits),
                     'subtotal' => $subtotalInMinorUnits,
