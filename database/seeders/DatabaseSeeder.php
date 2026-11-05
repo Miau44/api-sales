@@ -3,9 +3,10 @@
 namespace Database\Seeders;
 
 use App\Models\User;
-// use Illuminate\Database\Console\Seeds\WithoutModelEvents;
+use App\Models\Product;
 use Illuminate\Database\Seeder;
-use Illuminate\Support\Facades\Hash;
+use Illuminate\Database\QueryException;
+use RuntimeException;
 
 class DatabaseSeeder extends Seeder
 {
@@ -14,20 +15,54 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        // User::factory(10)->create();
+        $this->ensureTestUser();
 
-        User::factory()->create([
-            'name' => 'Test User',
-            'email' => 'admin@test.com',
-            'password' => Hash::make('password')
-        ]);
+        if (! Product::query()->exists()) {
+            $this->call(ProductSeeder::class);
+        }
+    }
 
-        \App\Models\User::create([
-            'name' => 'Usuario Demo',
-            'email' => 'master@test.com',
-            'password' => Hash::make('password')
-        ]);
+    private function ensureTestUser(): void
+    {
+        if (User::query()->whereKey(1)->exists()) {
+            return;
+        }
 
-        $this->call(ProductSeeder::class);
+        if (! app()->environment(['local', 'testing'])) {
+            throw new RuntimeException(
+                'User ID 1 is missing. Demo credentials are only seeded in local/testing; provision the required user explicitly.'
+            );
+        }
+
+        $email = 'admin@test.com';
+        if (User::query()->where('email', $email)->exists()) {
+            throw new RuntimeException(
+                "Cannot create test user ID 1: email {$email} is already assigned to another user."
+            );
+        }
+
+        try {
+            User::unguarded(function () use ($email): void {
+                User::query()->create([
+                    'id' => 1,
+                    'name' => 'Test User',
+                    'email' => $email,
+                    'password' => 'password',
+                ]);
+            });
+        } catch (QueryException $exception) {
+            if (User::query()->whereKey(1)->exists()) {
+                return;
+            }
+
+            if (User::query()->where('email', $email)->exists()) {
+                throw new RuntimeException(
+                    "Cannot create test user ID 1: email {$email} was claimed by another user.",
+                    previous: $exception
+                );
+            }
+
+            throw $exception;
+        }
     }
 }
